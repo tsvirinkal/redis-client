@@ -11,13 +11,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/go-redis/redis/v8"
 )
 
-//var ctx = context.Background()
-var ctx context.Context
 var cancelFunc context.CancelFunc
 var client *redis.Client
 var messageQueue []string // List to store messages
@@ -47,8 +46,7 @@ func initClient(host string, port int) {
 	client = redis.NewClient(&redis.Options{
 		Addr: addr,
 	})
-	ctx, cancelFunc = context.WithCancel(context.Background())
-	log.Printf("Initialized Redis client at %s ctx=%p cancelFunc=%p\n", addr, ctx, cancelFunc)
+	log.Printf("Initialized Redis client at %s\n", addr)
 }
 
 // Subscribe to a Redis channel and store messages in the queue
@@ -56,17 +54,14 @@ func initClient(host string, port int) {
 func Subscribe(channel *C.char) {
 	ch := C.GoString(channel)
 	log.Printf("Subscribing to channel: %s\n", ch)
+	ctx := context.Background()
 	sub := client.Subscribe(ctx, ch)
 	if sub == nil {
 		log.Printf("Failed to subscribe to channel %s: ", ch)
 		return
 	}
+
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("Recovered from panic in subscription goroutine: %v", r)
-			}
-		}()
 		for {
 			select {
 			case msg, ok := <-sub.Channel():
@@ -77,7 +72,7 @@ func Subscribe(channel *C.char) {
 				addMessageToQueue(msg.Payload)
 			case <-ctx.Done():
 				_ = sub.Unsubscribe(ctx, ch)
-				log.Println("Subscription loop stopped")
+				log.Println("Subscription stopped")
 				return
 			}
 		}
@@ -99,7 +94,7 @@ func GetNextMessage() *C.char {
 	msg := messageQueue[0]
 	messageQueue = messageQueue[1:]
 	log.Printf("Message retrieved from queue: %s\n", msg)
-	return C.CString(msg)
+	return C.CString(toWideChars(msg))
 }
 
 // Add a message to the queue
@@ -140,6 +135,11 @@ func Cleanup() {
 		logFile.Close()
 		logFile = nil
 	}
+}
+
+func toWideChars(input string) string {
+	chars := strings.Split(input, "")
+	return strings.Join(chars, " ")
 }
 
 func main() {
