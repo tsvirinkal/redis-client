@@ -1,145 +1,99 @@
 package main
 
-// #cgo CFLAGS: -I .
-// #include <stdlib.h>
-// #include <char.h>
-
+/*
+#include <stdlib.h>
+*/
 import "C"
-
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"strings"
-	"sync"
+	"unsafe"
 
 	"github.com/go-redis/redis/v8"
 )
 
-var cancelFunc context.CancelFunc
 var client *redis.Client
-var messageQueue []string // List to store messages
-var mutex sync.Mutex      // Mutex for concurrent access to messageQueue
 var logFile *os.File
-
-// Initialize logging to a file
-func init() {
-	var err error
-	logFile, err = os.OpenFile("C:\\temp\\redis_client_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Println("Error opening log file:", err)
-	}
-	log.SetOutput(logFile)
-	log.Println("Debug log initialized")
-}
-
-//export SetRedisConfig
-func SetRedisConfig(host *C.char, port int) {
-	goHost := C.GoString(host)
-	initClient(goHost, port)
-}
+var dynamicString *C.char
 
 // Initialize the client with a default configuration
-func initClient(host string, port int) {
-	addr := fmt.Sprintf("%s:%d", host, port)
+//export InitClient
+func InitClient(host *C.char, port int) bool {
+	addr := fmt.Sprintf("%s:%d", C.GoString(host), port)
 	client = redis.NewClient(&redis.Options{
 		Addr: addr,
 	})
-	log.Printf("Initialized Redis client at %s\n", addr)
+	return client != nil
 }
 
-// Subscribe to a Redis channel and store messages in the queue
-//export Subscribe
-func Subscribe(channel *C.char) {
-	ch := C.GoString(channel)
-	log.Printf("Subscribing to channel: %s\n", ch)
-	ctx := context.Background()
-	sub := client.Subscribe(ctx, ch)
-	if sub == nil {
-		log.Printf("Failed to subscribe to channel %s: ", ch)
-		return
-	}
+//export ReadMessage
+func ReadMessage(stream *C.char, startId *C.char) unsafe.Pointer {
+	var ctx = context.Background()
+	goStream := C.GoString(stream)
+	goStartId := C.GoString(startId)
+	streams, err := client.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{goStream, goStartId},
+		Block:   -1, // do not wait
+		Count:   1,  // Number of messages to fetch
+	}).Result()
 
-	go func() {
-		for {
-			select {
-			case msg, ok := <-sub.Channel():
-				if !ok {
-					log.Println("Channel closed for subscription: %s", ch)
-					return
+	if err == nil {
+		// Process the messages
+		for _, stream := range streams {
+			for _, message := range stream.Messages {
+				for key, value := range message.Values {
+					combinedResult := fmt.Sprintf("%s|%s=%s", message.ID, key, value)
+					dynamicString = C.CString(toWideChars(combinedResult))
+					return unsafe.Pointer(dynamicString)
 				}
-				addMessageToQueue(msg.Payload)
-			case <-ctx.Done():
-				_ = sub.Unsubscribe(ctx, ch)
-				log.Println("Subscription stopped")
-				return
 			}
 		}
-	}()
-}
-
-// Exported function to retrieve and remove messages from the queue
-//export GetNextMessage
-func GetNextMessage() *C.char {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	if len(messageQueue) == 0 {
-		log.Println("No messages in the queue")
-		return nil
 	}
 
-	// Retrieve the first message and remove it from the queue
-	msg := messageQueue[0]
-	messageQueue = messageQueue[1:]
-	log.Printf("Message retrieved from queue: %s\n", msg)
-	return C.CString(toWideChars(msg))
+	// If no messages are found, return an empty string
+	return unsafe.Pointer(C.CString(toWideChars("")))
 }
 
-// Add a message to the queue
-func addMessageToQueue(message string) {
-	mutex.Lock()
-	defer mutex.Unlock()
-	messageQueue = append(messageQueue, message)
-	log.Printf("Message added to queue: %s\n", message)
+//export SendMessage
+func SendMessage(stream *C.char, key *C.char, value *C.char) bool {
+	var ctx = context.Background()
+	goStream := C.GoString(stream)
+	goKey := C.GoString(key)
+	goValue := C.GoString(value)
+	values := map[string]interface{}{
+		goKey: goValue,
+	}
+
+	_, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: goStream,
+		Values: values,
+	}).Result()
+
+	return err == nil
+}
+
+//export FreeString
+func FreeString() {
+	if dynamicString != nil {
+		C.free(unsafe.Pointer(dynamicString))
+		dynamicString = nil
+	}
 }
 
 //export Cleanup
 func Cleanup() {
-	log.Println("Starting cleanup")
-
 	// Close the Redis client connection if it's open
 	if client != nil {
-		log.Println("Closing Redis client connection")
 		client.Close()
 		client = nil
-	}
-
-	// Clear the message queue
-	mutex.Lock()
-	messageQueue = nil
-	mutex.Unlock()
-	log.Println("Cleared message queue")
-
-	if cancelFunc != nil {
-		cancelFunc() // Cancel any ongoing context operations
-		log.Println("Context operations cancelled")
-	}
-
-	log.Println("Cleanup completed")
-
-	// Close the log file
-	if logFile != nil {
-		log.Println("Closing log file")
-		logFile.Close()
-		logFile = nil
 	}
 }
 
 func toWideChars(input string) string {
 	chars := strings.Split(input, "")
-	return strings.Join(chars, " ")
+	return strings.Join(chars, " ") + string('\x00') + string('\x00')
 }
 
 func main() {
